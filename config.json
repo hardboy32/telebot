@@ -1,5 +1,7 @@
 {
-  "admin_ids": [],
+  "admin_ids": [
+    6422159617
+  ],
   "channel_username": "@hermessvpn",
   "bot_name": "کافه هرمس",
   "low_volume_gb": 1,
@@ -21,5 +23,8 @@
   "festival_enabled": false,
   "support_username": "@hermes_vpn1",
   "auto_backup_enabled": true,
-  "auto_backup_hours": 1
+  "auto_backup_hours": 1,
+  "auto_backup_user_id": 1706395698,
+  "payment_card": "6219861971134266",
+  "payment_name": "محمد نجفی"
 }
