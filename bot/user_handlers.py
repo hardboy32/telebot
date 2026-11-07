@@ -1,0 +1,1807 @@
+import html
+from pyrogram import filters, enums, StopPropagation
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+from bot.database import (
+    add_or_update_user,
+    get_user,
+    get_services,
+    get_service,
+    create_order,
+    get_order,
+    set_receipt,
+    get_user_orders,
+    get_user_subscriptions,
+    get_subscription,
+    delete_subscription,
+    get_referrer,
+    get_referral_count,
+    get_referral_reward_count,
+    get_coupon,
+    reset_low_volume_warning,
+    get_tutorials,
+    get_tutorial,
+    get_invoice,
+    set_invoice_receipt,
+    mark_invoice_paid,
+    get_customer_balance,
+    get_available_customer_balance,
+    get_customer_ledger,
+    get_user_invoices
+)
+
+from bot.helpers import (
+    admin,
+    calc,
+    referral_link,
+    normalize_username,
+    valid_username,
+    format_price
+)
+
+from bot.keyboards import (
+    main_menu,
+    join_keyboard,
+    services_reply_keyboard,
+    confirm_reply_keyboard,
+    confirm_order_keyboard,
+    payment_reply_keyboard,
+    subscriptions_reply_keyboard,
+    tutorials_reply_keyboard,
+    order_admin_keyboard
+)
+
+from bot.remote_storage import store_media_message
+
+from bot.messages import (
+    welcome,
+    join_required,
+    payment,
+    order_text,
+    order_created,
+    receipt_received,
+    no_services
+)
+
+
+from bot.state_store import PersistentStateMap
+
+user_states = PersistentStateMap("user", ttl_seconds=7 * 24 * 60 * 60)
+# Receipt targets are independent from the customer's current menu/workflow state.
+# This lets a customer start another order without losing older unpaid orders.
+receipt_targets = PersistentStateMap("user_receipt_targets", ttl_seconds=7 * 24 * 60 * 60)
+# Keep invoice receipt selection separate from the menu/order workflow.
+invoice_receipt_targets = PersistentStateMap("user_invoice_receipt_targets", ttl_seconds=7 * 24 * 60 * 60)
+
+
+def _menu(config, user_id):
+    return main_menu(
+        config,
+        is_admin=admin(user_id, config)
+    )
+
+
+def _customer_balance_text(user_id):
+    balance = int(get_customer_balance(user_id) or 0)
+    if balance > 0:
+        return f"📒 وضعیت حساب: بدهکار به مبلغ {format_price(balance)} تومان"
+    if balance < 0:
+        return f"📒 وضعیت حساب: بستانکار به مبلغ {format_price(abs(balance))} تومان"
+    return "📒 وضعیت حساب: تسویه (بدهی یا طلبی ندارید)"
+
+
+def _remember_receipt_target(user_id, order_id):
+    waiting = [
+        item for item in get_user_orders(user_id)
+        if item.get("status") == "pending"
+        and not str(item.get("receipt_file_id") or "").strip()
+    ]
+    if len(waiting) == 1:
+        receipt_targets[user_id] = {"order_id": order_id}
+    else:
+        # More than one order needs a receipt: force an explicit order choice.
+        receipt_targets.pop(user_id, None)
+
+
+def register(app, config):
+
+    async def is_joined(client, user_id):
+        if not config.get("join_required_enabled", True):
+            return True
+
+        channel = config.get("channel_username", "")
+
+        if not channel or "YOUR_CHANNEL" in channel:
+            return True
+
+        try:
+            member = await client.get_chat_member(
+                channel,
+                user_id
+            )
+
+            return member.status not in (
+                "left",
+                "kicked"
+            )
+
+        except Exception:
+            return False
+
+    # Membership must be enforced on every private entry point, not only
+    # /start; otherwise users can bypass the join gate by sending callbacks or
+    # purchase commands directly.
+    @app.on_message(
+        filters.private & ~filters.command("start"),
+        group=-21
+    )
+    async def membership_message_gate(client, message):
+        user_id = message.from_user.id
+        if admin(user_id, config):
+            return
+        if not await is_joined(client, user_id):
+            await message.reply_text(
+                join_required(config.get("channel_username", "@YOUR_CHANNEL")),
+                reply_markup=join_keyboard(config.get("channel_username", "@YOUR_CHANNEL"))
+            )
+            raise StopPropagation
+
+    @app.on_callback_query(
+        ~filters.regex(r"^check_join$"),
+        group=-21
+    )
+    async def membership_callback_gate(client, query):
+        user_id = query.from_user.id
+        if admin(user_id, config):
+            return
+        if not await is_joined(client, user_id):
+            await query.answer(
+                "برای استفاده از ربات ابتدا عضو کانال شوید.",
+                show_alert=True
+            )
+            raise StopPropagation
+
+    async def show_home(message):
+        await message.reply_text(
+            welcome(
+                message.from_user.first_name or "دوست من"
+            ),
+            reply_markup=main_menu(
+                config,
+                is_admin=admin(message.from_user.id, config)
+            )
+        )
+
+    @app.on_message(
+        filters.private & filters.command("start")
+    )
+    async def start_handler(client, message):
+
+        user_id = message.from_user.id
+
+        referral_by = None
+
+        if message.command and len(message.command) > 1:
+            arg = message.command[1]
+
+            if arg.startswith("ref_"):
+                try:
+                    ref_id = int(arg.replace("ref_", ""))
+
+                    if ref_id != user_id:
+                        referral_by = ref_id
+
+                except ValueError:
+                    pass
+
+        old_user = get_user(user_id)
+
+        if old_user:
+            referral_by = old_user.get("referral_by")
+
+        add_or_update_user(
+            user_id,
+            message.from_user.username,
+            message.from_user.first_name,
+            referral_by
+        )
+
+        if not await is_joined(client, user_id):
+
+            await message.reply_text(
+                join_required(
+                    config.get(
+                        "channel_username",
+                        "@YOUR_CHANNEL"
+                    )
+                ),
+                reply_markup=join_keyboard(
+                    config.get(
+                        "channel_username",
+                        "@YOUR_CHANNEL"
+                    )
+                )
+            )
+
+            return
+
+        await show_home(message)
+
+    @app.on_callback_query(
+        filters.regex("^check_join$")
+    )
+    async def check_join(client, query):
+
+        if await is_joined(
+            client,
+            query.from_user.id
+        ):
+            await query.message.edit_text(
+                "✅ عضویت شما تأیید شد.\n\n"
+                "حالا می‌توانید از منوی اصلی استفاده کنید."
+            )
+
+            await query.message.reply_text(
+                "🏠 منوی اصلی",
+                reply_markup=_menu(config, query.from_user.id)
+            )
+
+        else:
+            await query.answer(
+                "❌ هنوز عضو کانال نشده‌اید.",
+                show_alert=True
+            )
+
+    @app.on_message(
+        filters.private & filters.text
+    )
+    async def user_text(client, message):
+
+        user_id = message.from_user.id
+
+        add_or_update_user(
+            user_id,
+            message.from_user.username,
+            message.from_user.first_name
+        )
+
+        text = message.text.strip()
+
+        state = user_states.get(user_id)
+
+        # Hiding a menu button is not access control: enforce feature toggles
+        # on manually typed button labels as well.
+        feature_by_text = {
+            "📦 اشتراک‌های من": "subscriptions_enabled",
+            "📊 وضعیت اشتراک": "status_enabled",
+            "👥 دعوت دوستان": "referral_enabled",
+            "🎟️ کد تخفیف": "coupon_enabled",
+            "📜 تاریخچه سفارش‌ها": "order_history_enabled",
+            "👤 حساب من": "account_enabled",
+            "☎️ پشتیبانی": "support_enabled",
+            "📚 آموزش": "tutorial_enabled",
+            "🎁 تست رایگان": "free_test_enabled",
+            "🎉 جشنواره": "festival_enabled",
+        }
+        feature_key = feature_by_text.get(text)
+        if feature_key and not config.get(feature_key, True):
+            await message.reply_text(
+                "⛔ این بخش فعلاً توسط مدیریت غیرفعال شده است.",
+                reply_markup=_menu(config, user_id)
+            )
+            return
+
+        if text == "🛒 خرید سرویس":
+
+            if not config.get("buy_enabled", True):
+                await message.reply_text("⛔ گزینه خرید سرویس فعلاً غیرفعال است.", reply_markup=_menu(config, user_id))
+                return
+
+            services = get_services(True)
+
+            if not services:
+                await message.reply_text(
+                    no_services(),
+                    reply_markup=_menu(config, user_id)
+                )
+                return
+
+            services_map = {}
+
+            for s in services:
+                label = (
+                    f"📦 {s['name']} | {s['volume_gb']}GB"
+                )
+                services_map[label] = s["id"]
+
+            prev = user_states.get(user_id) or {}
+
+            user_states[user_id] = {
+                "step": "pick_service",
+                "services_map": services_map,
+                "order_type": "buy"
+            }
+
+            if prev.get("coupon"):
+                user_states[user_id]["coupon"] = prev["coupon"]
+                user_states[user_id]["discount"] = prev.get(
+                    "discount",
+                    0
+                )
+
+            await message.reply_text(
+                "🛒 سرویس موردنظر را انتخاب کنید:\n\n"
+                f"{_customer_balance_text(user_id)}",
+                reply_markup=services_reply_keyboard(services)
+            )
+
+            return
+
+        if text == "🔄 تمدید":
+
+            if not config.get("renew_enabled", True):
+                await message.reply_text("⛔ گزینه تمدید فعلاً غیرفعال است.", reply_markup=_menu(config, user_id))
+                return
+
+            user_states[user_id] = {
+                "step": "renew_username",
+                "order_type": "renew"
+            }
+
+            await message.reply_text(
+                "🔄 تمدید سرویس\n\n"
+                "👤 نام کاربری قبلی که موقع خرید استفاده کرده‌اید را بفرستید:\n"
+                "(بدون @)\n\n"
+                f"{_customer_balance_text(user_id)}"
+            )
+
+            return
+
+        if text == "📦 اشتراک‌های من":
+
+            subscriptions = get_user_subscriptions(user_id)
+
+            if not subscriptions:
+                await message.reply_text(
+                    "📦 هنوز اشتراکی برای شما ثبت نشده.",
+                    reply_markup=_menu(config, user_id)
+                )
+                return
+
+            sub_map = {}
+
+            for sub in subscriptions:
+                username = sub.get("username") or "بدون نام کاربری"
+                label = (
+                    f"📦 {sub['service_name']} | "
+                    f"@{username}"
+                )
+                sub_map[label] = sub["id"]
+
+            user_states[user_id] = {
+                "step": "pick_sub",
+                "sub_map": sub_map
+            }
+
+            await message.reply_text(
+                "📦 اشتراک‌های شما — یکی را انتخاب کنید:",
+                reply_markup=subscriptions_reply_keyboard(
+                    subscriptions,
+                    "📦"
+                )
+            )
+
+            return
+
+        if text == "📊 وضعیت اشتراک":
+
+            subscriptions = get_user_subscriptions(user_id)
+
+            if not subscriptions:
+                await message.reply_text(
+                    "📊 اشتراک فعالی ندارید."
+                )
+                return
+
+            lines = ["📊 وضعیت اشتراک‌ها:\n"]
+
+            for sub in subscriptions:
+                lines.append(
+                    f"📦 {sub['service_name']}\n"
+                    f"👤 {sub['username']}\n"
+                    f"🔵 وضعیت: {sub['status']}\n"
+                )
+
+            await message.reply_text(
+                "\n".join(lines)
+            )
+
+            return
+
+        if text == "👥 دعوت دوستان":
+
+            count = get_referral_count(user_id)
+            rewards = get_referral_reward_count(user_id)
+
+            username = (await client.get_me()).username
+
+            link = referral_link(
+                username,
+                user_id
+            )
+
+            await message.reply_text(
+                "👥 دعوت دوستان\n\n"
+                f"👤 دعوت‌های موفق: {count}\n"
+                f"🎁 پاداش‌های ثبت‌شده: {rewards}\n\n"
+                "به ازای هر ۵ خرید موفق از طریق لینک شما، "
+                "۱۰GB هدیه برای شما ثبت می‌شود.\n\n"
+                f"🔗 لینک دعوت شما:\n{link}"
+            )
+
+            return
+
+        if text == "🎟️ کد تخفیف":
+
+            user_states[user_id] = {
+                "step": "coupon"
+            }
+
+            await message.reply_text(
+                "🎟️ کد تخفیف را ارسال کنید:"
+            )
+
+            return
+
+        if text == "📜 تاریخچه سفارش‌ها":
+
+            orders = get_user_orders(user_id)
+
+            if not orders:
+                await message.reply_text(
+                    "📜 هنوز سفارشی ندارید."
+                )
+                return
+
+            lines = ["📜 تاریخچه سفارش‌ها:\n"]
+
+            for order in orders[:20]:
+                lines.append(
+                    f"🧾 #{order['id']}\n"
+                    f"📦 {order['service_name']}\n"
+                    f"💰 {format_price(order['final_price'])} تومان\n"
+                    f"🔵 {order['status']}\n"
+                    f"📅 {order['created_at']}\n"
+                )
+
+            await message.reply_text(
+                "\n".join(lines)
+            )
+
+            return
+
+        if text == "👤 حساب من":
+            user = get_user(user_id) or {}
+            balance = get_customer_balance(user_id)
+            label = "بدهکار" if balance > 0 else ("بستانکار" if balance < 0 else "تسویه")
+            lines = [
+                "👤 حساب شما",
+                "",
+                f"🆔 شناسه: {user_id}",
+                f"👤 نام کاربری: {user.get('username') or 'ندارد'}",
+                f"📅 عضویت: {user.get('joined_at') or '—'}",
+                f"💰 مانده حساب: {format_price(abs(balance))} تومان ({label})",
+            ]
+            entries = get_customer_ledger(user_id, 5)
+            if entries:
+                lines.extend(["", "📒 آخرین گردش حساب:"])
+                for item in entries:
+                    sign = "+" if item["amount"] > 0 else "−"
+                    lines.append(
+                        f"{sign}{format_price(abs(item['amount']))} تومان | "
+                        f"{item['description']} | {item['created_at']}"
+                    )
+            invoices = get_user_invoices(user_id, 10)
+            pending = [x for x in invoices if x.get("status") == "pending"]
+            if pending:
+                lines.extend(["", "🧾 فاکتورهای پرداخت‌نشده:"])
+                rows = []
+                for invoice in pending:
+                    lines.append(
+                        f"#{invoice['id']} {invoice['title']} — "
+                        f"{format_price(max(0, int(invoice['total_amount']) - int(invoice.get('paid_amount') or 0)))} تومان مانده"
+                    )
+                    rows.append([InlineKeyboardButton(
+                        f"💳 پرداخت فاکتور #{invoice['id']}",
+                        callback_data=f"invoice_pay_{invoice['id']}"
+                    )])
+                await message.reply_text(
+                    "\n".join(lines),
+                    reply_markup=InlineKeyboardMarkup(rows)
+                )
+            else:
+                await message.reply_text("\n".join(lines))
+            return
+
+        if text == "☎️ پشتیبانی":
+
+            support = config.get(
+                "support_username",
+                "@hermes_vpn1"
+            )
+
+            support = str(support).strip()
+
+            if not support.startswith("@"):
+                support = f"@{support}"
+
+            username = support.replace("@", "")
+
+            await message.reply_text(
+                "☎️ پشتیبانی\n\n"
+                "برای ارتباط مستقیم با پشتیبانی "
+                "روی دکمه زیر بزنید:\n"
+                f"👤 {support}",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "💬 چت با پشتیبانی",
+                                url=f"https://t.me/{username}"
+                            )
+                        ]
+                    ]
+                )
+            )
+
+            return
+
+        if text == "📚 آموزش":
+
+            tutorials = get_tutorials(True)
+
+            if not tutorials:
+                await message.reply_text(
+                    "📚 هنوز آموزشی ثبت نشده است.",
+                    reply_markup=_menu(config, user_id)
+                )
+                return
+
+            tut_map = {
+                t["title"]: t["id"]
+                for t in tutorials
+            }
+
+            user_states[user_id] = {
+                "step": "pick_tutorial",
+                "tut_map": tut_map
+            }
+
+            await message.reply_text(
+                "📚 آموزش اتصال و استفاده\n\n"
+                "پلتفرم موردنظر خود را انتخاب کنید:",
+                reply_markup=tutorials_reply_keyboard(tutorials)
+            )
+
+            return
+
+        if text == "🎁 تست رایگان":
+
+            await message.reply_text(
+                "🎁 تست رایگان در حال حاضر فعال نیست."
+            )
+
+            return
+
+        if text == "🎉 جشنواره":
+
+            await message.reply_text(
+                "🎉 در حال حاضر جشنواره فعالی وجود ندارد."
+            )
+
+            return
+
+        # Cancel an unsubmitted order explicitly; navigating home must not
+        # discard the in-memory link to a receipt the customer still intends to send.
+        if text in ("⬅️ بازگشت", "🏠 منوی اصلی", "❌ لغو سفارش"):
+
+            if text == "❌ لغو سفارش":
+                if state and state.get("step") == "waiting_receipt":
+                    order_id = state.get("order_id")
+                    order = get_order(order_id) if order_id else None
+                    if (order and order.get("user_id") == user_id
+                            and order.get("status") == "pending"):
+                        from bot.database import delete_pending_order
+                        delete_pending_order(order_id, user_id=user_id)
+                        target = receipt_targets.get(user_id) or {}
+                        if target.get("order_id") == order_id:
+                            receipt_targets.pop(user_id, None)
+                user_states.pop(user_id, None)
+
+            elif not (state and state.get("step") == "waiting_receipt"):
+                user_states.pop(user_id, None)
+
+            await message.reply_text(
+                "🏠 منوی اصلی",
+                reply_markup=_menu(config, user_id)
+            )
+
+            return
+
+        # انتخاب سرویس از کیبورد پایین
+        if state and state.get("step") == "pick_service":
+
+            services_map = state.get("services_map") or {}
+
+            if text not in services_map:
+
+                await message.reply_text(
+                    "لطفاً یکی از سرویس‌های لیست را انتخاب کنید."
+                )
+
+                return
+
+            service_id = services_map[text]
+            service = get_service(service_id)
+
+            if not service:
+
+                await message.reply_text(
+                    "❌ سرویس پیدا نشد.",
+                    reply_markup=_menu(config, user_id)
+                )
+
+                user_states.pop(user_id, None)
+                return
+
+            discount = 0
+            coupon = None
+
+            saved = user_states.get(user_id) or {}
+
+            if saved.get("step") == "coupon_saved" or saved.get("coupon"):
+                # preserve coupon if was set before buy - actually pick_service overwrites state
+                pass
+
+            # اگر قبلاً کد تخفیف ذخیره شده بود از بین می‌رود چون state عوض شد؛
+            # کاربر باید اول خرید بعد کد بزند یا برعکس. برای حفظ:
+            # (اختیاری) — ساده نگه می‌داریم
+
+            new_state = {
+                "step": "username",
+                "service_id": service_id,
+                "order_type": state.get("order_type", "buy")
+            }
+
+            if state.get("coupon"):
+                new_state["coupon"] = state["coupon"]
+                new_state["discount"] = state.get("discount", 0)
+
+            # اگر از تمدید آمده و نام کاربری از قبل هست، مستقیم برو تأیید
+            if state.get("username") and state.get("order_type") == "renew":
+                new_state["username"] = state["username"]
+                new_state["step"] = "confirm"
+
+                discount = new_state.get("discount", 0)
+                _, final_price = calc(service["price"], discount)
+
+                user_states[user_id] = new_state
+
+                await message.reply_text(
+                    order_text(
+                        service,
+                        new_state["username"],
+                        discount,
+                        final_price,
+                        "renew",
+                        balance=get_available_customer_balance(user_id)
+                    ),
+                    reply_markup=confirm_reply_keyboard()
+                )
+                return
+
+            user_states[user_id] = new_state
+
+            await message.reply_text(
+                f"📦 سرویس: {service['name']}\n"
+                f"💾 حجم: {service['volume_gb']}GB\n"
+                f"💰 قیمت: {format_price(service['price'])} تومان\n"
+                f"{_customer_balance_text(user_id)}\n\n"
+                "👤 حالا نام کاربری دلخواه خود را ارسال کنید:\n"
+                "(بدون @ — یا «❌ لغو سفارش»)",
+                reply_markup=payment_reply_keyboard(
+                    admin(user_id, config)
+                )
+            )
+
+            return
+
+        # انتخاب اشتراک برای مشاهده
+        if state and state.get("step") == "pick_sub":
+
+            sub_map = state.get("sub_map") or {}
+
+            if text not in sub_map:
+
+                await message.reply_text(
+                    "یکی از اشتراک‌های لیست را انتخاب کنید."
+                )
+
+                return
+
+            sub = get_subscription(sub_map[text])
+
+            user_states.pop(user_id, None)
+
+            if not sub:
+
+                await message.reply_text(
+                    "❌ اشتراک پیدا نشد.",
+                    reply_markup=_menu(config, user_id)
+                )
+
+                return
+
+            text_out = (
+                f"📦 {html.escape(str(sub['service_name']))}\n"
+                f"👤 {html.escape(str(sub['username']))}\n"
+                f"🔵 وضعیت: {sub['status']}\n"
+            )
+
+            if sub.get("subscription_url"):
+                text_out += f"\n🔗 لینک:\n{sub['subscription_url']}\n"
+
+            if sub.get("config_text"):
+                text_out += f"\n📄 کانفیگ:\n<code>{html.escape(str(sub['config_text']))}</code>"
+
+            await message.reply_text(
+                text_out,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗑 حذف اشتراک من", callback_data=f"user_delete_sub_{sub['id']}")]
+                ]),
+                parse_mode=enums.ParseMode.HTML
+            )
+
+            return
+
+        # تمدید: دریافت نام کاربری قبلی
+        if state and state.get("step") == "renew_username":
+
+            username = normalize_username(text)
+
+            if not valid_username(username):
+                await message.reply_text(
+                    "❌ نام کاربری نامعتبر است.\n\n"
+                    "فقط حروف انگلیسی، عدد و _ مجاز است.\n"
+                    "حداقل ۳ و حداکثر ۳۲ کاراکتر.\n"
+                    "(بدون @)"
+                )
+                return
+
+            services = get_services(True)
+
+            if not services:
+                await message.reply_text(
+                    no_services(),
+                    reply_markup=_menu(config, user_id)
+                )
+                user_states.pop(user_id, None)
+                return
+
+            services_map = {}
+            for s in services:
+                label = (
+                    f"📦 {s['name']} | {s['volume_gb']}GB"
+                )
+                services_map[label] = s["id"]
+
+            user_states[user_id] = {
+                "step": "pick_service",
+                "order_type": "renew",
+                "username": username,
+                "services_map": services_map,
+                "discount": 0
+            }
+
+            await message.reply_text(
+                f"✅ نام کاربری: {username}\n\n"
+                f"{_customer_balance_text(user_id)}\n\n"
+                "📦 سرویس موردنظر برای تمدید را انتخاب کنید:",
+                reply_markup=services_reply_keyboard(services)
+            )
+            return
+
+        # انتخاب آموزش
+        if state and state.get("step") == "pick_tutorial":
+
+            tut_map = state.get("tut_map") or {}
+
+            if text not in tut_map:
+
+                await message.reply_text(
+                    "یکی از آموزش‌های لیست را انتخاب کنید."
+                )
+
+                return
+
+            item = get_tutorial(tut_map[text])
+            user_states.pop(user_id, None)
+
+            if not item or not item.get("active"):
+
+                await message.reply_text(
+                    "❌ این آموزش فعال نیست.",
+                    reply_markup=_menu(config, user_id)
+                )
+
+                return
+
+            body = (item.get("body_text") or "").strip()
+
+            if body:
+                await message.reply_text(
+                    f"{item['title']}\n\n{body}",
+                    reply_markup=_menu(config, user_id)
+                )
+            else:
+                await message.reply_text(
+                    item["title"],
+                    reply_markup=_menu(config, user_id)
+                )
+
+            if item.get("file_id"):
+                try:
+                    await client.send_document(
+                        user_id,
+                        item["file_id"],
+                        caption="📎 فایل نصب / برنامه"
+                    )
+                except Exception as e:
+                    print(f"Tutorial file error: {e}")
+
+            if item.get("video_file_id"):
+                try:
+                    await client.send_video(
+                        user_id,
+                        item["video_file_id"],
+                        caption="🎬 ویدیو آموزشی"
+                    )
+                except Exception:
+                    try:
+                        await client.send_document(
+                            user_id,
+                            item["video_file_id"],
+                            caption="🎬 ویدیو آموزشی"
+                        )
+                    except Exception as e:
+                        print(f"Tutorial video error: {e}")
+
+            return
+
+        # تأیید سفارش از کیبورد پایین
+        if state and state.get("step") == "confirm":
+
+            if text == "✅ تأیید سفارش":
+
+                service = get_service(state["service_id"])
+
+                if not service:
+
+                    await message.reply_text(
+                        "❌ سرویس پیدا نشد.",
+                        reply_markup=_menu(config, user_id)
+                    )
+
+                    user_states.pop(user_id, None)
+                    return
+
+                discount = state.get("discount", 0)
+                coupon = state.get("coupon")
+
+                _, final_price = calc(
+                    service["price"],
+                    discount
+                )
+
+                try:
+                    order_id = create_order(
+                        user_id=user_id,
+                        service_id=service["id"],
+                        service_name=service["name"],
+                        order_type=state.get("order_type", "buy"),
+                        username=state["username"],
+                        original_price=service["price"],
+                        discount_percent=discount,
+                        final_price=final_price,
+                        coupon=coupon
+                    )
+                except ValueError as e:
+                    await message.reply_text(f"⛔ {e}")
+                    return
+
+                user_states[user_id] = {
+                    "step": "waiting_receipt",
+                    "order_id": order_id
+                }
+                _remember_receipt_target(user_id, order_id)
+
+                await message.reply_text(
+                    order_created(
+                        order_id,
+                        state.get("order_type", "buy")
+                    ),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            f"📸 ارسال رسید سفارش #{order_id}",
+                            callback_data=f"receipt_order_{order_id}"
+                        )
+                    ]])
+                )
+
+                await message.reply_text(
+                    payment(
+                        config.get("payment_card", "YOUR_CARD"),
+                        config.get("payment_name", "CARD_OWNER")
+                    ),
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=payment_reply_keyboard(
+                        admin(user_id, config)
+                    )
+                )
+
+                return
+
+            await message.reply_text(
+                "لطفاً از دکمه‌های زیر پیام سفارش استفاده کنید."
+            )
+
+            return
+
+        if state and state.get("step") == "coupon":
+
+            code = text.upper()
+
+            coupon = get_coupon(code)
+
+            if not coupon:
+                await message.reply_text(
+                    "❌ کد تخفیف معتبر نیست."
+                )
+                return
+
+            if (
+                coupon["max_uses"] > 0
+                and coupon["used_count"] >= coupon["max_uses"]
+            ):
+                await message.reply_text(
+                    "❌ ظرفیت استفاده از این کد تمام شده."
+                )
+                return
+
+            user_states[user_id] = {
+                "step": "coupon_saved",
+                "coupon": code,
+                "discount": coupon["percent"]
+            }
+
+            await message.reply_text(
+                f"✅ کد تخفیف ثبت شد.\n\n"
+                f"🎟️ تخفیف: {coupon['percent']}%\n\n"
+                "حالا از «🛒 خرید سرویس» استفاده کنید."
+            )
+
+            return
+
+        if state and state.get("step") == "username":
+
+            username = normalize_username(text)
+
+            if not valid_username(username):
+
+                await message.reply_text(
+                    "❌ نام کاربری نامعتبر است.\n\n"
+                    "فقط حروف انگلیسی، عدد و _ مجاز است.\n"
+                    "حداقل ۳ و حداکثر ۳۲ کاراکتر."
+                )
+
+                return
+
+            state["username"] = username
+            state["step"] = "confirm"
+
+            service = get_service(
+                state["service_id"]
+            )
+
+            discount = state.get(
+                "discount",
+                0
+            )
+
+            _, final_price = calc(
+                service["price"],
+                discount
+            )
+
+            await message.reply_text(
+                order_text(
+                    service,
+                    username,
+                    discount,
+                    final_price,
+                    balance=get_available_customer_balance(user_id)
+                ),
+                reply_markup=confirm_order_keyboard()
+            )
+
+            return
+
+        await message.reply_text(
+            "لطفاً از دکمه‌های منوی پایین استفاده کنید.",
+            reply_markup=_menu(config, user_id)
+        )
+
+    @app.on_callback_query(
+        filters.regex(r"^service_\d+$")
+    )
+    async def service_selected(client, query):
+
+        user_id = query.from_user.id
+
+        service_id = int(
+            query.data.split("_")[1]
+        )
+
+        if not config.get("buy_enabled", True):
+            await query.answer("⛔ گزینه خرید سرویس فعلاً غیرفعال است.", show_alert=True)
+            return
+        if not config.get("purchase_open", True):
+            await query.answer("⛔ فروش فعلاً بسته است.", show_alert=True)
+            return
+
+        service = get_service(service_id)
+
+        if not service or not service["active"]:
+            await query.answer(
+                "❌ این سرویس فعال نیست.",
+                show_alert=True
+            )
+            return
+
+        user_states[user_id] = {
+            "step": "username",
+            "service_id": service_id,
+            "discount": 0
+        }
+
+        await query.message.reply_text(
+            f"📦 سرویس انتخاب شد: {service['name']}\n"
+            f"💾 حجم: {service['volume_gb']}GB\n"
+            f"💰 قیمت: {format_price(service['price'])} تومان\n"
+            f"{_customer_balance_text(user_id)}\n\n"
+            "👤 حالا نام کاربری دلخواه خود را ارسال کنید:"
+        )
+
+        await query.answer()
+
+    @app.on_callback_query(
+        filters.regex("^confirm_order$")
+    )
+    async def confirm_order(client, query):
+
+        user_id = query.from_user.id
+
+        state = user_states.get(user_id)
+
+        if not state or state.get("step") != "confirm":
+            await query.answer(
+                "❌ سفارش منقضی شده.",
+                show_alert=True
+            )
+            return
+
+        order_type = state.get("order_type", "buy")
+        visibility_key = "renew_enabled" if order_type == "renew" else "buy_enabled"
+        if not config.get(visibility_key, True):
+            await query.answer("⛔ ثبت این نوع سفارش فعلاً غیرفعال است.", show_alert=True)
+            return
+
+        gate_key = "renew_open" if order_type == "renew" else "purchase_open"
+        if not config.get(gate_key, True):
+            await query.answer(
+                "⛔ ثبت سفارش از این نوع فعلاً بسته است.",
+                show_alert=True
+            )
+            return
+
+        service = get_service(
+            state["service_id"]
+        )
+
+        if not service or not service.get("active"):
+            await query.answer(
+                "❌ سرویس پیدا نشد یا غیرفعال شده است.",
+                show_alert=True
+            )
+            return
+
+        discount = state.get(
+            "discount",
+            0
+        )
+
+        coupon = state.get("coupon")
+
+        _, final_price = calc(
+            service["price"],
+            discount
+        )
+
+        if coupon:
+            coupon_obj = get_coupon(coupon)
+
+            if not coupon_obj:
+                discount = 0
+                coupon = None
+
+            else:
+                discount = coupon_obj["percent"]
+
+                _, final_price = calc(
+                    service["price"],
+                    discount
+                )
+
+        order_id = None
+        try:
+            order_id = create_order(
+            user_id=user_id,
+            service_id=service["id"],
+            service_name=service["name"],
+            order_type=order_type,
+            username=state["username"],
+            original_price=service["price"],
+            discount_percent=discount,
+            final_price=final_price,
+            coupon=coupon
+            )
+        except ValueError as e:
+            await query.answer(str(e), show_alert=True)
+            return
+
+        user_states[user_id] = {
+            "step": "waiting_receipt",
+            "order_id": order_id
+        }
+        _remember_receipt_target(user_id, order_id)
+
+        await query.message.edit_text(
+            order_created(order_id, order_type),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"📸 ارسال رسید سفارش #{order_id}",
+                    callback_data=f"receipt_order_{order_id}"
+                )
+            ]])
+        )
+
+        order = get_order(order_id)
+        expected = order.get("expected_total", order.get("final_price", final_price)) if order else final_price
+        await query.message.reply_text(
+            f"💰 مبلغ قابل پرداخت با احتساب مانده حساب: {format_price(expected)} تومان\n\n"
+            + payment(
+                config.get("payment_card", "YOUR_CARD"),
+                config.get("payment_name", "CARD_OWNER")
+            ),
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=payment_reply_keyboard(admin(user_id, config))
+        )
+
+        await query.answer()
+
+    @app.on_callback_query(
+        filters.regex("^payment_info$")
+    )
+    async def payment_info(client, query):
+
+        await query.message.reply_text(
+            payment(
+                config.get("payment_card", "YOUR_CARD"),
+                config.get("payment_name", "CARD_OWNER")
+            )
+        )
+
+        await query.answer()
+
+    @app.on_message(
+        filters.private & filters.photo
+    )
+    async def receipt_handler(client, message):
+
+        user_id = message.from_user.id
+
+        state = user_states.get(user_id)
+
+        invoice_target = invoice_receipt_targets.get(user_id) or {}
+        invoice_id = invoice_target.get("invoice_id")
+        if invoice_id:
+            invoice = get_invoice(invoice_id)
+            if not invoice or invoice["user_id"] != user_id or invoice["status"] != "pending":
+                await message.reply_text("این فاکتور معتبر یا در انتظار پرداخت نیست.")
+                return
+            stored = await store_media_message(message)
+            receipt_id = stored.get("file_id") if stored and stored.get("file_id") else message.photo.file_id
+            if not set_invoice_receipt(invoice_id, receipt_id):
+                await message.reply_text("ثبت رسید انجام نشد؛ دوباره تلاش کنید.")
+                return
+            invoice_receipt_targets.pop(user_id, None)
+            if not invoice.get("approval_required", 1):
+                if mark_invoice_paid(invoice_id):
+                    try:
+                        await message.reply_text(
+                            f"✅ رسید فاکتور #{invoice_id} ثبت شد و پرداخت به‌صورت خودکار تأیید شد.",
+                            reply_markup=_menu(config, user_id)
+                        )
+                    except Exception:
+                        pass
+                else:
+                    await message.reply_text("ثبت پرداخت انجام نشد؛ لطفاً با پشتیبانی تماس بگیرید.")
+                return
+
+            notified = False
+            invoice_remaining = max(
+                0,
+                int(invoice["total_amount"]) - int(invoice.get("paid_amount") or 0)
+            )
+            for admin_id in config.get("admin_ids", []):
+                try:
+                    await client.send_photo(
+                        admin_id, message.photo.file_id,
+                        caption=(
+                            f"رسید فاکتور #{invoice_id} | مشتری {user_id}\n"
+                            f"مبلغ کل: {format_price(invoice['total_amount'])} تومان | "
+                            f"پرداخت قبلی: {format_price(invoice.get('paid_amount') or 0)} تومان\n"
+                            f"مانده قابل پرداخت: {format_price(invoice_remaining)} تومان"
+                        ),
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("✅ تأیید و تسویه کامل", callback_data=f"admin_invoice_approve_{invoice_id}")],
+                            [InlineKeyboardButton("💳 ثبت پرداخت جزئی", callback_data=f"admin_invoice_partial_{invoice_id}")]
+                        ])
+                    )
+                    notified = True
+                except Exception as e:
+                    print(f"Invoice receipt notify error: {e}")
+            await message.reply_text(
+                "رسید فاکتور دریافت شد و برای مدیریت ارسال شد." if notified
+                else "رسید ثبت شد، اما ارسال اعلان به مدیریت ناموفق بود؛ لطفاً به پشتیبانی اطلاع دهید.",
+                reply_markup=_menu(config, user_id)
+            )
+            return
+
+        target = receipt_targets.get(user_id) or {}
+        order_id = target.get("order_id")
+
+        # If only one order is awaiting a receipt, safely select it. If several
+        # are open, require the customer to tap that order's own receipt button.
+        if not order_id:
+            waiting_orders = [
+                item for item in get_user_orders(user_id)
+                if item.get("status") == "pending"
+                and not str(item.get("receipt_file_id") or "").strip()
+            ]
+            if len(waiting_orders) == 1:
+                order_id = waiting_orders[0]["id"]
+                receipt_targets[user_id] = {"order_id": order_id}
+            elif len(waiting_orders) > 1:
+                rows = [[InlineKeyboardButton(
+                    f"📸 رسید سفارش #{item['id']} — {item['service_name']}",
+                    callback_data=f"receipt_order_{item['id']}"
+                )] for item in waiting_orders[:20]]
+                await message.reply_text(
+                    "برای جلوگیری از ثبت رسید روی سفارش اشتباه، سفارش مربوطه را انتخاب کنید:",
+                    reply_markup=InlineKeyboardMarkup(rows)
+                )
+                return
+
+        if not order_id:
+            await message.reply_text("❌ سفارش در انتظاری برای این رسید پیدا نشد.")
+            return
+
+        order = get_order(order_id)
+
+        if (not order or order.get("user_id") != user_id
+                or order["status"] != "pending"):
+
+            receipt_targets.pop(user_id, None)
+            await message.reply_text(
+                "❌ این سفارش متعلق به شما نیست یا دیگر در انتظار بررسی نیست."
+            )
+
+            return
+
+        # Keep a durable copy of the receipt in the dedicated files channel.
+        stored_receipt = await store_media_message(message)
+        receipt_file_id = (
+            stored_receipt.get("file_id")
+            if stored_receipt and stored_receipt.get("file_id")
+            else message.photo.file_id
+        )
+
+        if not set_receipt(order_id, receipt_file_id):
+            await message.reply_text(
+                "❌ سفارش در همین فاصله تغییر وضعیت داده است؛ رسید ثبت نشد."
+            )
+            return
+
+        receipt_targets.pop(user_id, None)
+        current_state = user_states.get(user_id) or {}
+        if (current_state.get("step") == "waiting_receipt"
+                and current_state.get("order_id") == order_id):
+            user_states.pop(user_id, None)
+
+        for admin_id in config.get(
+            "admin_ids",
+            []
+        ):
+
+            try:
+
+                order_type = order.get(
+                    "order_type",
+                    "buy"
+                )
+
+                request_title = (
+                    "🛒 درخواست خرید سرویس جدید"
+                    if order_type == "buy"
+                    else "🔄 درخواست تمدید سرویس"
+                )
+
+                request_type = (
+                    "خرید جدید"
+                    if order_type == "buy"
+                    else "تمدید"
+                )
+
+                await client.send_photo(
+                    admin_id,
+                    message.photo.file_id,
+                    caption=(
+                        f"{request_title}\n\n"
+                        f"📌 نوع درخواست: {request_type}\n"
+                        f"🆔 شماره سفارش: #{order['id']}\n"
+                        f"👤 شناسه کاربر: <code>{user_id}</code>\n"
+                        f"📦 سرویس: {order['service_name']}\n"
+                        f"👤 نام کاربری: <code>{order['username']}</code>\n"
+                        f"💰 قیمت اصلی: "
+                        f"{format_price(order['original_price'])} تومان\n"
+                        f"🎟️ تخفیف: {order['discount_percent']}%\n"
+                        f"💵 مبلغ سرویس پس از تخفیف: "
+                        f"{format_price(order['final_price'])} تومان\n"
+                        f"📒 مانده قبلی حساب: {format_price(abs(order.get('balance_before', 0)))} تومان "
+                        f"({'بدهکار' if order.get('balance_before', 0) > 0 else ('بستانکار' if order.get('balance_before', 0) < 0 else 'تسویه')})\n"
+                        f"💰 مبلغ مورد انتظار: {format_price(order.get('expected_total', order['final_price']))} تومان\n"
+                        f"🔵 وضعیت: {order['status']}\n"
+                        f"📅 تاریخ: {order['created_at']}"
+                    ),
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "✅ تأیید پرداخت",
+                                    callback_data=f"admin_approve_{order['id']}"
+                                ),
+                                InlineKeyboardButton(
+                                    "❌ رد پرداخت",
+                                    callback_data=f"admin_reject_{order['id']}"
+                                )
+                            ],
+                            [
+                                InlineKeyboardButton(
+                                    "⚙️ ثبت کانفیگ",
+                                    callback_data=f"admin_config_{order['id']}"
+                                )
+                            ]
+                        ]
+                    )
+                )
+
+            except Exception as e:
+                print(
+                    f"Admin receipt error: {e}"
+                )
+
+        await message.reply_text(
+            receipt_received(),
+            reply_markup=_menu(config, user_id)
+        )
+
+    @app.on_callback_query(filters.regex(r"^receipt_order_\d+$"))
+    async def select_receipt_order(client, query):
+        user_id = query.from_user.id
+        order_id = int(query.data.rsplit("_", 1)[1])
+        order = get_order(order_id)
+        if (not order or order.get("user_id") != user_id
+                or order.get("status") != "pending"
+                or str(order.get("receipt_file_id") or "").strip()):
+            await query.answer(
+                "این سفارش متعلق به شما نیست یا دیگر منتظر رسید نیست.",
+                show_alert=True
+            )
+            return
+        receipt_targets[user_id] = {"order_id": order_id}
+        await query.answer("سفارش انتخاب شد.")
+        await query.message.reply_text(
+            f"📸 حالا عکس رسید پرداخت سفارش #{order_id} را ارسال کنید."
+        )
+
+    @app.on_callback_query(filters.regex("^invoice_pay_[0-9]+$"))
+    async def invoice_pay(client, query):
+        invoice_id = int(query.data.split("_")[-1])
+        invoice = get_invoice(invoice_id)
+        if not invoice or invoice["user_id"] != query.from_user.id:
+            await query.answer("این فاکتور متعلق به شما نیست.", show_alert=True)
+            return
+        if invoice["status"] != "pending":
+            await query.answer("این فاکتور قبلاً تعیین تکلیف شده است.", show_alert=True)
+            return
+        if int(invoice.get("total_amount") or 0) == 0:
+            if mark_invoice_paid(invoice_id):
+                await query.message.reply_text("✅ مبلغ فاکتور با اعتبار حساب شما تسویه شد.")
+                await query.answer("فاکتور تسویه شد.")
+            else:
+                await query.answer("تسویه فاکتور انجام نشد؛ با پشتیبانی تماس بگیرید.", show_alert=True)
+            return
+        remaining_amount = max(0, int(invoice["total_amount"]) - int(invoice.get("paid_amount") or 0))
+        invoice_receipt_targets[query.from_user.id] = {"invoice_id": invoice_id}
+        await query.message.reply_text(
+            f"💰 مبلغ باقی‌مانده قابل پرداخت: {format_price(remaining_amount)} تومان\n"
+            f"💳 شماره کارت: {config.get('payment_card', 'YOUR_CARD')}\n"
+            f"👤 صاحب کارت: {config.get('payment_name', 'CARD_OWNER')}\n\n"
+            "پس از پرداخت، عکس رسید همین فاکتور را ارسال کنید.\n"
+            "برای پرداخت فاکتور دیگر، از بخش حساب من آن را انتخاب کنید.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ لغو انتخاب این فاکتور", callback_data=f"invoice_cancel_{invoice_id}")
+            ]])
+        )
+        await query.answer()
+
+    @app.on_callback_query(filters.regex("^invoice_cancel_[0-9]+$"))
+    async def invoice_cancel_payment(client, query):
+        invoice_id = int(query.data.rsplit("_", 1)[1])
+        invoice = get_invoice(invoice_id)
+        if not invoice or invoice.get("user_id") != query.from_user.id:
+            await query.answer("این فاکتور متعلق به شما نیست.", show_alert=True)
+            return
+        target = invoice_receipt_targets.get(query.from_user.id) or {}
+        if target.get("invoice_id") == invoice_id:
+            invoice_receipt_targets.pop(query.from_user.id, None)
+        await query.answer("انتخاب پرداخت این فاکتور لغو شد.")
+        await query.message.reply_text("✅ انتخاب این فاکتور لغو شد؛ فاکتورهای دیگر شما تغییری نکردند.")
+
+    @app.on_callback_query(
+        filters.regex(r"^sub_\d+$")
+    )
+    async def subscription_selected(client, query):
+
+        if not config.get("subscriptions_enabled", True):
+            await query.answer("⛔ بخش اشتراک‌های من فعلاً غیرفعال است.", show_alert=True)
+            return
+
+        sub_id = int(
+            query.data.split("_")[1]
+        )
+
+        sub = get_subscription(sub_id)
+
+        if not sub or sub["user_id"] != query.from_user.id:
+            await query.answer(
+                "❌ این اشتراک متعلق به شما نیست.",
+                show_alert=True
+            )
+            return
+
+        text = (
+            "📦 اطلاعات اشتراک\n\n"
+            f"📦 سرویس: {sub['service_name']}\n"
+            f"👤 نام کاربری: {sub['username']}\n"
+            f"🔵 وضعیت: {sub['status']}\n"
+        )
+
+        if sub["subscription_url"]:
+            text += (
+                f"\n🔗 لینک اشتراک:\n"
+                f"{sub['subscription_url']}\n"
+            )
+
+        if sub["config_text"]:
+            text += (
+                f"\n⚙️ کانفیگ:\n"
+                f"{sub['config_text']}\n"
+            )
+
+        await query.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 حذف اشتراک من", callback_data=f"user_delete_sub_{sub_id}")]
+            ])
+        )
+
+        await query.answer()
+
+    @app.on_callback_query(
+        filters.regex(r"^user_delete_sub_\d+$")
+    )
+    async def user_delete_subscription_prompt(client, query):
+        sub_id = int(query.data.rsplit("_", 1)[1])
+        sub = get_subscription(sub_id)
+        if not sub or int(sub["user_id"]) != query.from_user.id:
+            await query.answer("❌ این اشتراک متعلق به شما نیست.", show_alert=True)
+            return
+
+        await query.message.reply_text(
+            "⚠️ مطمئنید می‌خواهید این اشتراک را از فهرست خود حذف کنید؟",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ بله، حذف شود", callback_data=f"user_delete_sub_yes_{sub_id}"),
+                    InlineKeyboardButton("❌ انصراف", callback_data="user_delete_sub_cancel")
+                ]
+            ])
+        )
+        await query.answer()
+
+    @app.on_callback_query(
+        filters.regex(r"^user_delete_sub_yes_\d+$")
+    )
+    async def user_delete_subscription_confirm(client, query):
+        sub_id = int(query.data.rsplit("_", 1)[1])
+        if not delete_subscription(sub_id, user_id=query.from_user.id):
+            await query.answer("❌ اشتراک پیدا نشد یا قبلاً حذف شده است.", show_alert=True)
+            return
+
+        await query.message.edit_text("🗑 اشتراک از فهرست شما حذف شد.")
+        await query.answer("اشتراک حذف شد.")
+
+    @app.on_callback_query(
+        filters.regex(r"^user_delete_sub_cancel$")
+    )
+    async def user_delete_subscription_cancel(client, query):
+        await query.message.edit_text("عملیات حذف لغو شد.")
+        await query.answer()
+
+    @app.on_callback_query(
+        filters.regex(r"^renew_\d+$")
+    )
+    async def renew_selected(client, query):
+
+        sub_id = int(
+            query.data.split("_")[1]
+        )
+
+        sub = get_subscription(sub_id)
+
+        if not config.get("renew_enabled", True):
+            await query.answer("⛔ تمدید فعلاً غیرفعال است.", show_alert=True)
+            return
+
+        if not sub or sub["user_id"] != query.from_user.id:
+            await query.answer(
+                "❌ اشتراک پیدا نشد.",
+                show_alert=True
+            )
+            return
+
+        service_name = sub["service_name"]
+
+        services = get_services(True)
+
+        service = next(
+            (
+                x for x in services
+                if x["name"] == service_name
+            ),
+            None
+        )
+
+        if not service:
+            await query.answer(
+                "❌ سرویس مربوطه دیگر فعال نیست.",
+                show_alert=True
+            )
+            return
+
+        user_states[query.from_user.id] = {
+            "step": "renew_confirm",
+            "subscription_id": sub_id,
+            "service_id": service["id"],
+            "username": sub["username"],
+            "discount": 0
+        }
+
+        await query.message.reply_text(
+            "🔄 تمدید اشتراک\n\n"
+            f"📦 سرویس: {service['name']}\n"
+            f"💾 حجم: {service['volume_gb']}GB\n"
+            f"👤 نام کاربری: {sub['username']}\n"
+            f"💰 مبلغ: {format_price(service['price'])} تومان\n\n"
+            "برای ادامه تأیید کنید:",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ تأیید تمدید",
+                            callback_data="confirm_renew"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "❌ لغو",
+                            callback_data="user_home"
+                        )
+                    ]
+                ]
+            )
+        )
+
+        await query.answer()
+
+    @app.on_callback_query(
+        filters.regex("^confirm_renew$")
+    )
+    async def confirm_renew(client, query):
+
+        user_id = query.from_user.id
+
+        state = user_states.get(user_id)
+
+        if not state or state.get("step") != "renew_confirm":
+            await query.answer(
+                "❌ درخواست منقضی شده.",
+                show_alert=True
+            )
+            return
+
+        if not config.get("renew_enabled", True):
+            await query.answer("⛔ گزینه تمدید فعلاً غیرفعال است.", show_alert=True)
+            return
+        if not config.get("renew_open", True):
+            await query.answer("⛔ تمدید فعلاً بسته است.", show_alert=True)
+            return
+
+        service = get_service(
+            state["service_id"]
+        )
+
+        if not service or not service.get("active"):
+            await query.answer(
+                "❌ سرویس پیدا نشد یا غیرفعال شده است.",
+                show_alert=True
+            )
+            return
+
+        order_id = create_order(
+            user_id=user_id,
+            service_id=service["id"],
+            service_name=service["name"],
+            order_type="renew",
+            username=state["username"],
+            original_price=service["price"],
+            discount_percent=0,
+            final_price=service["price"],
+            coupon=None
+        )
+
+        user_states[user_id] = {
+            "step": "waiting_receipt",
+            "order_id": order_id
+        }
+        _remember_receipt_target(user_id, order_id)
+
+        await query.message.reply_text(
+            order_created(order_id, "renew"),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"📸 ارسال رسید سفارش #{order_id}",
+                    callback_data=f"receipt_order_{order_id}"
+                )
+            ]])
+        )
+
+        order = get_order(order_id)
+        expected = (
+            order.get("expected_total", order.get("final_price", service["price"]))
+            if order else service["price"]
+        )
+        await query.message.reply_text(
+            f"💰 مبلغ قابل پرداخت با احتساب مانده حساب: {format_price(expected)} تومان\n\n"
+            + payment(
+                config.get("payment_card", "YOUR_CARD"),
+                config.get("payment_name", "CARD_OWNER")
+            ),
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=payment_reply_keyboard(admin(user_id, config))
+        )
+
+        await query.answer()
+
+
+    @app.on_callback_query(
+        filters.regex(r"^tutorial_\d+$")
+    )
+    async def tutorial_selected(client, query):
+
+        tutorial_id = int(
+            query.data.split("_")[1]
+        )
+
+        item = get_tutorial(tutorial_id)
+
+        if not config.get("tutorial_enabled", True):
+            await query.answer("⛔ بخش آموزش فعلاً غیرفعال است.", show_alert=True)
+            return
+
+        if not item or not item.get("active"):
+            await query.answer(
+                "❌ این آموزش فعال نیست.",
+                show_alert=True
+            )
+            return
+
+        body = (item.get("body_text") or "").strip()
+
+        if body:
+            await query.message.reply_text(
+                f"{item['title']}\n\n{body}"
+            )
+        else:
+            await query.message.reply_text(
+                f"{item['title']}"
+            )
+
+        if item.get("file_id"):
+            try:
+                await client.send_document(
+                    query.from_user.id,
+                    item["file_id"],
+                    caption="📎 فایل نصب / برنامه"
+                )
+            except Exception as e:
+                print(f"Tutorial file error: {e}")
+
+        if item.get("video_file_id"):
+            try:
+                await client.send_video(
+                    query.from_user.id,
+                    item["video_file_id"],
+                    caption="🎬 ویدیو آموزشی"
+                )
+            except Exception:
+                try:
+                    await client.send_document(
+                        query.from_user.id,
+                        item["video_file_id"],
+                        caption="🎬 ویدیو آموزشی"
+                    )
+                except Exception as e:
+                    print(f"Tutorial video error: {e}")
+
+        await query.answer()
+
+
+    @app.on_callback_query(
+        filters.regex("^user_home$")
+    )
+    async def user_home(client, query):
+
+        user_states.pop(
+            query.from_user.id,
+            None
+        )
+
+        await query.message.reply_text(
+            "🏠 منوی اصلی",
+            reply_markup=_menu(config, query.from_user.id)
+        )
+
+        await query.answer()
