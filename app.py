@@ -96,15 +96,6 @@ def load_config():
     config["api_hash"] = api_hash
     config["bot_token"] = bot_token
 
-    raw_admin_ids = os.getenv("ADMIN_IDS")
-    if raw_admin_ids is not None:
-        try:
-            config["admin_ids"] = [int(value.strip()) for value in raw_admin_ids.split(",") if value.strip()]
-        except ValueError as exc:
-            raise RuntimeError("ADMIN_IDS باید شناسه‌های عددی جداشده با کاما باشد.") from exc
-    if not config.get("admin_ids"):
-        raise RuntimeError("ADMIN_IDS در متغیرهای Railway تنظیم نشده است.")
-
     if "purchase_open" not in config:
         config["purchase_open"] = True
 
