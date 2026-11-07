@@ -13,6 +13,17 @@ import aiohttp
 DB_PATH = os.getenv("DATABASE_PATH", "data/cafe_hermes.db")
 CONFIG_PATH = "config.json"
 
+
+def _ensure_storage_directories():
+    """Create the local database and temporary-file directories, never the DB itself."""
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    os.makedirs("data", exist_ok=True)
+
+
+# Railway volumes may start completely empty. Create folders before any restore
+# download or shutdown sync attempts to write temporary files.
+_ensure_storage_directories()
+
 # Dedicated private storage channels. Environment values override the
 # repository defaults so deployments can move channels without code changes.
 STORAGE_CHAT_ID = os.getenv("STORAGE_CHAT_ID", "-1004448775237")
@@ -913,6 +924,9 @@ async def _download_document(
     message,
     destination
 ):
+    os.makedirs(os.path.dirname(os.path.abspath(destination)), exist_ok=True)
+    _ensure_storage_directories()
+
     document = (
         message.get("document")
         if isinstance(message, dict)
@@ -1059,6 +1073,7 @@ def _cleanup_extract_root(
 
 async def _restore_database_from_message(message):
     """Restore either the new raw SQLite backup or a legacy ZIP backup."""
+    _ensure_storage_directories()
     extract_root = "data/.remote_db_restore"
     temp_download = "data/.remote_db_download.tmp"
     recovery_copy = "data/cafe_hermes_before_restore.db"
