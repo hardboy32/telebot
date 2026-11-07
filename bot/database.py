@@ -215,14 +215,6 @@ def init_db():
     if "invoice_type" not in invoice_columns:
         cur.execute("ALTER TABLE invoices ADD COLUMN invoice_type TEXT NOT NULL DEFAULT 'payment'")
 
-    # Permanently purge legacy rejected orders so they no longer appear
-    # in customer history or admin views after this update.
-    cur.execute("""
-        DELETE FROM subscriptions
-        WHERE order_id IN (SELECT id FROM orders WHERE status = 'rejected')
-    """)
-    cur.execute("DELETE FROM orders WHERE status = 'rejected'")
-
     # seed default platforms if empty
     existing = cur.execute(
         "SELECT COUNT(*) AS c FROM tutorials"
@@ -770,7 +762,7 @@ def approve_order(order_id, created_by=None):
 
 
 def reject_order(order_id):
-    """Reject and permanently remove a pending order and its stored receipt."""
+    """Reject a pending order, release its coupon and keep an auditable record."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("BEGIN IMMEDIATE")
@@ -790,7 +782,11 @@ def reject_order(order_id):
             WHERE code = ?
         """, (str(row["coupon"]).upper(),))
 
-    cur.execute("DELETE FROM orders WHERE id = ? AND status = 'pending'", (order_id,))
+    cur.execute("""
+        UPDATE orders
+        SET status = 'rejected', receipt_file_id = NULL
+        WHERE id = ? AND status = 'pending'
+    """, (order_id,))
     if cur.rowcount != 1:
         conn.rollback()
         conn.close()
@@ -809,6 +805,7 @@ def get_user_orders(user_id):
         SELECT *
         FROM orders
         WHERE user_id = ?
+          AND status != 'rejected'
         ORDER BY id DESC
     """, (user_id,)).fetchall()
 
@@ -989,8 +986,16 @@ def delete_order(order_id):
         conn.close()
         return False
 
-    # Admin deletion also removes subscriptions created from this order.
-    cur.execute("DELETE FROM subscriptions WHERE order_id = ?", (order_id,))
+    # Keep approved orders that already created a subscription: deleting the
+    # order must never orphan or silently remove a customer's active service.
+    linked_subscription = cur.execute(
+        "SELECT id FROM subscriptions WHERE order_id = ? LIMIT 1",
+        (order_id,)
+    ).fetchone()
+    if linked_subscription:
+        conn.rollback()
+        conn.close()
+        return False
 
     # A pending order reserves one coupon use. Releasing/deleting that order
     # must return the reservation so abandoned orders do not exhaust coupons.
